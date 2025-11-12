@@ -1,1 +1,15 @@
+{
+  "functions": {
+    "api/scrape.js": {
+      "runtime": "nodejs18.x",
+      "maxDuration": 30
+    }
+  },
+  "routes": [
+    { "src": "^/$", "dest": "/api/scrape?q=Solfagraskolan" }
+  ],
+  "crons": [
+    { "path": "/api/scrape?q=Solfagraskolan", "schedule": "27 * * * *" }
+  ]
+}
 
