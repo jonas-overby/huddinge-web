@@ -9,7 +9,7 @@
     { "src": "^/$", "dest": "/api/scrape?q=Solfagraskolan" }
   ],
   "crons": [
-    { "path": "/api/scrape?q=Solfagraskolan", "schedule": "27 * * * *" }
+    { "path": "/api/scrape?q=Solfagraskolan", "schedule": "0 6 * * *" }
   ]
 }
 
