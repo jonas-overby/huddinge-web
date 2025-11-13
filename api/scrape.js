@@ -1,18 +1,22 @@
-// /api/scrape.js  (no external deps)
+// /api/scrape.js  – no external deps, psize=1000 & pindex pagination
+
 const BASE = "https://sammantraden.huddinge.se";
 const SEARCH = `${BASE}/search`;
-
-// YYYY-MM-DD (tillåter även / och . som separators)
 const DATE_RX = /\b(20\d{2})[-/.](\d{2})[-/.](\d{2})\b/g;
-
 const A_TAG_RX = /<a\s+[^>]*href\s*=\s*"(.*?)"[^>]*>([\s\S]*?)<\/a>/gi;
 
-// Hjälp: enkel HTML-escaper för output
 function esc(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function stripTags(s) {
+  return String(s || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function parseDateOne(s) {
@@ -23,27 +27,37 @@ function parseDateOne(s) {
   return isNaN(dt) ? null : dt;
 }
 
-function stripTags(s) {
-  return String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+// Hämta en sida med psize=1000 & pindex=...
+async function fetchPage(q, index) {
+  const url =
+    `${SEARCH}?text=${encodeURIComponent(q)}` +
+    `&psize=1000&pindex=${index}`;
+  const res = await fetch(url, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+    },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
+  return await res.text();
 }
 
-// Plocka ut kandidater runt varje datumträff och försök hitta vettig titel-länk
+// Plocka ut kandidater runt varje datum: titel, sidlänk, ev. pdf-länk
 function extractItemsFromHtml(html) {
   const items = [];
   const text = html;
 
-  // Hitta alla datumträffar + positioner
   let m;
   while ((m = DATE_RX.exec(text)) !== null) {
     const dateStr = m[0];
     const pos = m.index;
 
-    // Ta ett fönster runt datumet (kan justeras)
+    // Fönster runt datumet
     const start = Math.max(0, pos - 2000);
     const end = Math.min(text.length, pos + 2000);
     const windowHtml = text.slice(start, end);
 
-    // Samla alla <a> i fönstret
+    // Samla <a>-taggar i fönstret
     const anchors = [];
     let am;
     while ((am = A_TAG_RX.exec(windowHtml)) !== null) {
@@ -53,14 +67,13 @@ function extractItemsFromHtml(html) {
       anchors.push({ href, txt });
     }
 
-    // Heuristik: välj den FÖRSTA ankarlänken som ser ut som titel (inte tom, inte "#")
+    // Titel-länk
     let title = "";
     let pageUrl = null;
     for (const a of anchors) {
       if (!a.txt) continue;
       if (a.href.startsWith("#")) continue;
-      // hoppa över rena "Ladda ner"-länkar som titel
-      if (/ladda\s*ner/i.test(a.txt)) continue;
+      if (/ladda\s*ner/i.test(a.txt)) continue; // hoppa över rena "Ladda ner"
       title = a.txt;
       try {
         pageUrl = new URL(a.href, BASE).toString();
@@ -70,27 +83,26 @@ function extractItemsFromHtml(html) {
       if (title && pageUrl) break;
     }
 
-    // Leta separat efter en pdf-/download-länk i samma fönster
+    // Pdf-/download-länk
     let downloadUrl = null;
     for (const a of anchors) {
-      const h = a.href.toLowerCase();
+      const h = (a.href || "").toLowerCase();
       if (h.endsWith(".pdf") || h.includes("download")) {
         try {
           downloadUrl = new URL(a.href, BASE).toString();
-        } catch { /* ignore */ }
+        } catch {}
         if (downloadUrl) break;
       }
     }
 
     const date = parseDateOne(dateStr);
 
-    // Lägg till kandidat om vi fick något vettigt
     if (title || pageUrl || date) {
       items.push({ title, pageUrl, downloadUrl, date, _pos: pos });
     }
   }
 
-  // Rensa upp dubbletter (samma titel + datum)
+  // Rensa dubbletter (titel + url + datum)
   const uniq = [];
   const seen = new Set();
   for (const it of items) {
@@ -103,41 +115,63 @@ function extractItemsFromHtml(html) {
   return uniq;
 }
 
-// Enkel detektor för om det finns fler sidor (sök efter "Nästa" eller rel=next eller page=...)
-function hasNextPage(html) {
-  if (/rel=["']?next["']?/i.test(html)) return true;
-  if (/>Nästa</i.test(html)) return true;
-  // fallback: om det finns page=2,3,... länkar – vi använder enklare heuristik
-  if (/[\?&]page=\d+/.test(html)) return true;
-  return false;
+function monthLabel(date) {
+  const months = [
+    "Jan", "Feb", "Mar", "Apr", "Maj", "Jun",
+    "Jul", "Aug", "Sep", "Okt", "Nov", "Dec",
+  ];
+  const y = date.getUTCFullYear();
+  const m = months[date.getUTCMonth()] || "";
+  return `${m} ${y}`;
 }
 
-async function fetchPage(q, page) {
-  const url = `${SEARCH}?text=${encodeURIComponent(q)}&page=${page}`;
-  const res = await fetch(url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
-    }
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
-  return await res.text();
-}
-
-function rowHtml(item) {
-  const date = item.date ? item.date.toISOString().slice(0, 10) : "—";
-  const title = item.title || "—";
-  const titleHtml = item.pageUrl
-    ? `<a href="${item.pageUrl}" target="_blank" rel="noopener">${esc(title)}</a>`
-    : esc(title);
-  const dl = item.downloadUrl
-    ? ` · <a href="${item.downloadUrl}" target="_blank" rel="noopener">Ladda ner</a>`
-    : "";
-  return `<tr><td class="date-col">${date}</td><td>${titleHtml}${dl}</td></tr>`;
-}
-
-function htmlDoc(rowsHtml, q, count) {
+// Bygger HTML med rubrik per månad
+function buildHtmlByMonth(items, q) {
   const gen = new Date().toISOString().replace("T", " ").replace(".000Z", " UTC");
+
+  let sections = "";
+  let currentYM = null;
+  let openTable = false;
+
+  for (const it of items) {
+    const d = it.date;
+    const ym = d ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}` : "utan-datum";
+
+    if (ym !== currentYM) {
+      // stäng föregående tabell
+      if (openTable) {
+        sections += "</tbody></table>\n";
+        openTable = false;
+      }
+      currentYM = ym;
+
+      if (d) {
+        sections += `<h2 class="month-heading">${esc(monthLabel(d))}</h2>\n`;
+      } else {
+        sections += `<h2 class="month-heading">Utan datum</h2>\n`;
+      }
+
+      sections += `<table class="month-table">
+<thead><tr><th class="date-col">Datum</th><th>Titel &amp; länkar</th></tr></thead>
+<tbody>
+`;
+      openTable = true;
+    }
+
+    const dateStr = it.date ? it.date.toISOString().slice(0, 10) : "—";
+    const title = it.title || "—";
+    const titleHtml = it.pageUrl
+      ? `<a href="${it.pageUrl}" target="_blank" rel="noopener">${esc(title)}</a>`
+      : esc(title);
+    const dl = it.downloadUrl
+      ? ` · <a href="${it.downloadUrl}" target="_blank" rel="noopener">Ladda ner</a>`
+      : "";
+
+    sections += `<tr><td class="date-col">${dateStr}</td><td>${titleHtml}${dl}</td></tr>\n`;
+  }
+
+  if (openTable) sections += "</tbody></table>\n";
+
   return `<!doctype html>
 <html lang="sv">
 <head>
@@ -147,35 +181,33 @@ function htmlDoc(rowsHtml, q, count) {
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
   h1 { font-size: 1.35rem; margin: 0 0 8px; }
+  h2.month-heading { margin: 24px 0 8px; font-size: 1.1rem; }
   .meta { color:#555; margin-bottom:12px; }
   .buttons { margin:14px 0 22px; display:flex; gap:10px; flex-wrap:wrap; }
   .btn { display:inline-block; padding:10px 14px; border-radius:8px; text-decoration:none; border:1px solid #d0d7de; }
   .btn:hover { background:#f6f8fa; }
   table { border-collapse: collapse; width: 100%; }
-  th, td { padding: 10px 8px; border-bottom: 1px solid #e5e5e5; vertical-align: top; }
+  th, td { padding: 8px 6px; border-bottom: 1px solid #e5e5e5; vertical-align: top; font-size: 0.9rem; }
   th { text-align: left; }
   tr:hover td { background: #fafafa; }
-  .date-col { width: 120px; white-space: nowrap; }
+  .date-col { width: 110px; white-space: nowrap; }
 </style>
 </head>
 <body>
   <h1>Huddinge – sorterade sökresultat</h1>
-  <div class="meta">Sökterm: <strong>${esc(q)}</strong> · Antal: ${count} · Genererad: ${gen}</div>
+  <div class="meta">Sökterm: <strong>${esc(q)}</strong> · Antal: ${items.length} · Genererad: ${gen}</div>
 
   <div class="buttons">
     <a id="refresh" class="btn" href="#">↻ Uppdatera nu</a>
   </div>
 
-  <table>
-    <thead><tr><th class="date-col">Datum</th><th>Titel &amp; länkar</th></tr></thead>
-    <tbody>${rowsHtml}</tbody>
-  </table>
+  ${sections}
 
 <script>
   document.getElementById('refresh').addEventListener('click', (e) => {
     e.preventDefault();
     const u = new URL(window.location.href);
-    u.searchParams.set('t', Date.now()); // cache-bust
+    u.searchParams.set('t', Date.now());
     window.location.href = u.toString();
   });
 </script>
@@ -188,29 +220,39 @@ export default async function handler(req, res) {
     const url = new URL(req.url, "http://x");
     const q = url.searchParams.get("q") || "Solfagraskolan";
 
-    let page = 1;
     const items = [];
-    while (true) {
-      const html = await fetchPage(q, page);
-      const more = extractItemsFromHtml(html);
-      items.push(...more);
-      if (!hasNextPage(html)) break;
-      page += 1;
-      if (page > 50) break; // safety
+    const seenKeys = new Set();
+
+    // Paginerar över pindex = 1,2,3,... med psize=1000
+    for (let idx = 1; idx <= 50; idx++) {
+      const html = await fetchPage(q, idx);
+      const pageItems = extractItemsFromHtml(html);
+      if (pageItems.length === 0) break; // inga fler resultat
+
+      for (const it of pageItems) {
+        const key = `${it.title}__${it.pageUrl || ""}__${it.date ? it.date.toISOString() : ""}`;
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+          items.push(it);
+        }
+      }
+      // Om färre än 1000 poster på sidan → troligen sista sidan
+      if (pageItems.length < 1000) break;
     }
 
-    // sortera: med datum (desc) först, sedan utan datum
-    const withDate = items.filter(x => !!x.date).sort((a,b) => b.date - a.date);
+    // sortera: med datum (desc) först, sen utan datum
+    const withDate = items.filter(x => !!x.date).sort((a, b) => b.date - a.date);
     const withoutDate = items.filter(x => !x.date);
     const sorted = [...withDate, ...withoutDate];
 
-    const rows = sorted.map(rowHtml).join("");
-    const html = htmlDoc(rows, q, sorted.length);
+    const html = buildHtmlByMonth(sorted, q);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.status(200).send(html);
   } catch (err) {
-    res.status(500).send(
-      `<pre>${(err && err.stack) ? esc(err.stack) : esc(String(err))}</pre>`
-    );
+    res
+      .status(500)
+      .send(
+        `<pre>${(err && err.stack) ? esc(err.stack) : esc(String(err))}</pre>`
+      );
   }
 }
