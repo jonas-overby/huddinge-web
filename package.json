@@ -1,8 +1,5 @@
 {
   "name": "huddinge-scraper",
   "private": true,
-  "type": "module",
-  "dependencies": {
-    "cheerio": "^1.0.0-rc.12"
-  }
+  "type": "module"
 }
