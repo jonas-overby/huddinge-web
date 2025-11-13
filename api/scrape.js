@@ -1,4 +1,4 @@
-// /api/scrape.js  – no external deps, psize=1000 & pindex pagination
+// /api/scrape.js  – generisk sökning, ingen extern dependency
 
 const BASE = "https://sammantraden.huddinge.se";
 const SEARCH = `${BASE}/search`;
@@ -27,7 +27,7 @@ function parseDateOne(s) {
   return isNaN(dt) ? null : dt;
 }
 
-// Hämta en sida med psize=1000 & pindex=...
+// Hämtar en sida med psize=1000 & pindex=...
 async function fetchPage(q, index) {
   const url =
     `${SEARCH}?text=${encodeURIComponent(q)}` +
@@ -52,12 +52,10 @@ function extractItemsFromHtml(html) {
     const dateStr = m[0];
     const pos = m.index;
 
-    // Fönster runt datumet
     const start = Math.max(0, pos - 2000);
     const end = Math.min(text.length, pos + 2000);
     const windowHtml = text.slice(start, end);
 
-    // Samla <a>-taggar i fönstret
     const anchors = [];
     let am;
     while ((am = A_TAG_RX.exec(windowHtml)) !== null) {
@@ -67,13 +65,12 @@ function extractItemsFromHtml(html) {
       anchors.push({ href, txt });
     }
 
-    // Titel-länk
     let title = "";
     let pageUrl = null;
     for (const a of anchors) {
       if (!a.txt) continue;
       if (a.href.startsWith("#")) continue;
-      if (/ladda\s*ner/i.test(a.txt)) continue; // hoppa över rena "Ladda ner"
+      if (/ladda\s*ner/i.test(a.txt)) continue;
       title = a.txt;
       try {
         pageUrl = new URL(a.href, BASE).toString();
@@ -83,7 +80,6 @@ function extractItemsFromHtml(html) {
       if (title && pageUrl) break;
     }
 
-    // Pdf-/download-länk
     let downloadUrl = null;
     for (const a of anchors) {
       const h = (a.href || "").toLowerCase();
@@ -102,7 +98,6 @@ function extractItemsFromHtml(html) {
     }
   }
 
-  // Rensa dubbletter (titel + url + datum)
   const uniq = [];
   const seen = new Set();
   for (const it of items) {
@@ -125,9 +120,10 @@ function monthLabel(date) {
   return `${m} ${y}`;
 }
 
-// Bygger HTML med rubrik per månad
+// Bygger HTML med sökformulär + rubrik per månad
 function buildHtmlByMonth(items, q) {
   const gen = new Date().toISOString().replace("T", " ").replace(".000Z", " UTC");
+  const hasQuery = q && q.trim() !== "";
 
   let sections = "";
   let currentYM = null;
@@ -138,7 +134,6 @@ function buildHtmlByMonth(items, q) {
     const ym = d ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}` : "utan-datum";
 
     if (ym !== currentYM) {
-      // stäng föregående tabell
       if (openTable) {
         sections += "</tbody></table>\n";
         openTable = false;
@@ -172,30 +167,52 @@ function buildHtmlByMonth(items, q) {
 
   if (openTable) sections += "</tbody></table>\n";
 
+  let metaLine;
+  if (!hasQuery) {
+    metaLine = "Ingen sökterm angiven. Skriv en sökterm ovan och tryck <strong>Sök</strong>.";
+  } else {
+    metaLine = `Sökterm: <strong>${esc(q)}</strong> · Antal: ${items.length} · Genererad: ${gen}`;
+  }
+
+  const titleText = hasQuery ? `Huddinge – ${esc(q)}` : "Huddinge – sökning";
+
   return `<!doctype html>
 <html lang="sv">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Huddinge – sorterade sökresultat: ${esc(q)}</title>
+<title>${titleText}</title>
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
   h1 { font-size: 1.35rem; margin: 0 0 8px; }
   h2.month-heading { margin: 24px 0 8px; font-size: 1.1rem; }
   .meta { color:#555; margin-bottom:12px; }
   .buttons { margin:14px 0 22px; display:flex; gap:10px; flex-wrap:wrap; }
-  .btn { display:inline-block; padding:10px 14px; border-radius:8px; text-decoration:none; border:1px solid #d0d7de; }
+  .btn { display:inline-block; padding:8px 12px; border-radius:8px; text-decoration:none; border:1px solid #d0d7de; font-size:0.9rem; }
   .btn:hover { background:#f6f8fa; }
   table { border-collapse: collapse; width: 100%; }
   th, td { padding: 8px 6px; border-bottom: 1px solid #e5e5e5; vertical-align: top; font-size: 0.9rem; }
   th { text-align: left; }
   tr:hover td { background: #fafafa; }
   .date-col { width: 110px; white-space: nowrap; }
+  .search-form { margin: 12px 0 10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .search-input { padding:6px 8px; border-radius:6px; border:1px solid #d0d7de; min-width:220px; }
+  .search-submit { padding:7px 13px; border-radius:6px; border:1px solid #0969da; background:#0969da; color:white; cursor:pointer; font-size:0.9rem; }
+  .search-submit:hover { background:#0550ae; }
 </style>
 </head>
 <body>
   <h1>Huddinge – sorterade sökresultat</h1>
-  <div class="meta">Sökterm: <strong>${esc(q)}</strong> · Antal: ${items.length} · Genererad: ${gen}</div>
+
+  <form class="search-form" method="GET">
+    <label for="q">Sökterm:</label>
+    <input id="q" class="search-input" type="text" name="q"
+           placeholder="t.ex. Solfagraskolan, Inomhushall"
+           value="${esc(q || "")}">
+    <button class="search-submit" type="submit">Sök</button>
+  </form>
+
+  <div class="meta">${metaLine}</div>
 
   <div class="buttons">
     <a id="refresh" class="btn" href="#">↻ Uppdatera nu</a>
@@ -207,6 +224,7 @@ function buildHtmlByMonth(items, q) {
   document.getElementById('refresh').addEventListener('click', (e) => {
     e.preventDefault();
     const u = new URL(window.location.href);
+    // behåll q, men bumpa 't' för cache-bust
     u.searchParams.set('t', Date.now());
     window.location.href = u.toString();
   });
@@ -218,7 +236,16 @@ function buildHtmlByMonth(items, q) {
 export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://x");
-    const q = url.searchParams.get("q") || "Solfagraskolan";
+    const rawQ = url.searchParams.get("q") || "";
+    const q = rawQ.trim();
+
+    // Om ingen sökterm: visa bara sidan med sökfält, inga resultat
+    if (!q) {
+      const html = buildHtmlByMonth([], "");
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.status(200).send(html);
+      return;
+    }
 
     const items = [];
     const seenKeys = new Set();
@@ -227,7 +254,7 @@ export default async function handler(req, res) {
     for (let idx = 1; idx <= 50; idx++) {
       const html = await fetchPage(q, idx);
       const pageItems = extractItemsFromHtml(html);
-      if (pageItems.length === 0) break; // inga fler resultat
+      if (pageItems.length === 0) break;
 
       for (const it of pageItems) {
         const key = `${it.title}__${it.pageUrl || ""}__${it.date ? it.date.toISOString() : ""}`;
@@ -236,11 +263,9 @@ export default async function handler(req, res) {
           items.push(it);
         }
       }
-      // Om färre än 1000 poster på sidan → troligen sista sidan
       if (pageItems.length < 1000) break;
     }
 
-    // sortera: med datum (desc) först, sen utan datum
     const withDate = items.filter(x => !!x.date).sort((a, b) => b.date - a.date);
     const withoutDate = items.filter(x => !x.date);
     const sorted = [...withDate, ...withoutDate];
