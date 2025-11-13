@@ -1,35 +1,115 @@
-import fetch from "node-fetch"; // inbyggt i Node 18 via global fetch, men behåller import för tydlighet
-import * as cheerio from "cheerio";
-
+// /api/scrape.js  (no external deps)
 const BASE = "https://sammantraden.huddinge.se";
 const SEARCH = `${BASE}/search`;
-const DATE_RX = /\b(20\d{2})[-/.](\d{2})[-/.](\d{2})\b/;
 
-function parseDate(text) {
-  const m = DATE_RX.exec(text || "");
+// YYYY-MM-DD (tillåter även / och . som separators)
+const DATE_RX = /\b(20\d{2})[-/.](\d{2})[-/.](\d{2})\b/g;
+
+const A_TAG_RX = /<a\s+[^>]*href\s*=\s*"(.*?)"[^>]*>([\s\S]*?)<\/a>/gi;
+
+// Hjälp: enkel HTML-escaper för output
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function parseDateOne(s) {
+  const m = /\b(20\d{2})[-/.](\d{2})[-/.](\d{2})\b/.exec(s || "");
   if (!m) return null;
   const [_, y, mo, d] = m;
   const dt = new Date(`${y}-${mo}-${d}T00:00:00Z`);
   return isNaN(dt) ? null : dt;
 }
 
-function rowHtml(item) {
-  const date = item.date ? item.date.toISOString().slice(0,10) : "—";
-  const title = item.title || "—";
-  const titleHtml = item.pageUrl
-    ? `<a href="${item.pageUrl}" target="_blank" rel="noopener">${escapeHtml(title)}</a>`
-    : escapeHtml(title);
-  const dl = item.downloadUrl
-    ? ` · <a href="${item.downloadUrl}" target="_blank" rel="noopener">Ladda ner</a>`
-    : "";
-  return `<tr><td class="date-col">${date}</td><td>${titleHtml}${dl}</td></tr>`;
+function stripTags(s) {
+  return String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function escapeHtml(s) {
-  return (s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+// Plocka ut kandidater runt varje datumträff och försök hitta vettig titel-länk
+function extractItemsFromHtml(html) {
+  const items = [];
+  const text = html;
+
+  // Hitta alla datumträffar + positioner
+  let m;
+  while ((m = DATE_RX.exec(text)) !== null) {
+    const dateStr = m[0];
+    const pos = m.index;
+
+    // Ta ett fönster runt datumet (kan justeras)
+    const start = Math.max(0, pos - 2000);
+    const end = Math.min(text.length, pos + 2000);
+    const windowHtml = text.slice(start, end);
+
+    // Samla alla <a> i fönstret
+    const anchors = [];
+    let am;
+    while ((am = A_TAG_RX.exec(windowHtml)) !== null) {
+      const href = am[1] || "";
+      const inner = am[2] || "";
+      const txt = stripTags(inner);
+      anchors.push({ href, txt });
+    }
+
+    // Heuristik: välj den FÖRSTA ankarlänken som ser ut som titel (inte tom, inte "#")
+    let title = "";
+    let pageUrl = null;
+    for (const a of anchors) {
+      if (!a.txt) continue;
+      if (a.href.startsWith("#")) continue;
+      // hoppa över rena "Ladda ner"-länkar som titel
+      if (/ladda\s*ner/i.test(a.txt)) continue;
+      title = a.txt;
+      try {
+        pageUrl = new URL(a.href, BASE).toString();
+      } catch {
+        pageUrl = null;
+      }
+      if (title && pageUrl) break;
+    }
+
+    // Leta separat efter en pdf-/download-länk i samma fönster
+    let downloadUrl = null;
+    for (const a of anchors) {
+      const h = a.href.toLowerCase();
+      if (h.endsWith(".pdf") || h.includes("download")) {
+        try {
+          downloadUrl = new URL(a.href, BASE).toString();
+        } catch { /* ignore */ }
+        if (downloadUrl) break;
+      }
+    }
+
+    const date = parseDateOne(dateStr);
+
+    // Lägg till kandidat om vi fick något vettigt
+    if (title || pageUrl || date) {
+      items.push({ title, pageUrl, downloadUrl, date, _pos: pos });
+    }
+  }
+
+  // Rensa upp dubbletter (samma titel + datum)
+  const uniq = [];
+  const seen = new Set();
+  for (const it of items) {
+    const key = `${it.title}__${it.pageUrl || ""}__${it.date ? it.date.toISOString() : ""}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniq.push(it);
+    }
+  }
+  return uniq;
+}
+
+// Enkel detektor för om det finns fler sidor (sök efter "Nästa" eller rel=next eller page=...)
+function hasNextPage(html) {
+  if (/rel=["']?next["']?/i.test(html)) return true;
+  if (/>Nästa</i.test(html)) return true;
+  // fallback: om det finns page=2,3,... länkar – vi använder enklare heuristik
+  if (/[\?&]page=\d+/.test(html)) return true;
+  return false;
 }
 
 async function fetchPage(q, page) {
@@ -41,62 +121,19 @@ async function fetchPage(q, page) {
     }
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
-  const html = await res.text();
-  return cheerio.load(html);
+  return await res.text();
 }
 
-function findCards($) {
-  const cards = [];
-  $("li,div").each((_, el) => {
-    const nodeTxt = $(el).text() || "";
-    if (DATE_RX.test(nodeTxt) && $(el).find("a[href]").length) {
-      const t = nodeTxt.trim();
-      if (t.length < 5000) cards.push($(el));
-    }
-  });
-  return cards;
-}
-
-function extractCard($card) {
-  // titel-länk: första <a> med text
-  let title = "";
-  let pageUrl = null;
-  const aEls = $card.find("a[href]");
-  for (let i = 0; i < aEls.length; i++) {
-    const a = aEls.eq(i);
-    const txt = (a.text() || "").trim();
-    const href = a.attr("href") || "";
-    if (txt && !href.startsWith("#")) {
-      title = txt;
-      pageUrl = new URL(href, BASE).toString();
-      break;
-    }
-  }
-
-  const raw = $card.text() || "";
-  const date = parseDate(raw);
-
-  // försök hitta PDF-/download-länk
-  let downloadUrl = null;
-  aEls.each((_, el) => {
-    const h = aEls.eq(_).attr("href") || "";
-    if (h.toLowerCase().endsWith(".pdf") || h.toLowerCase().includes("download")) {
-      downloadUrl = new URL(h, BASE).toString();
-      return false;
-    }
-  });
-
-  return { title, pageUrl, downloadUrl, date };
-}
-
-function hasNextPage($) {
-  let found = false;
-  $("a[href]").each((_, a) => {
-    const txt = ($(a).text() || "").toLowerCase();
-    if (txt.includes("nästa") || txt.includes("next")) found = true;
-  });
-  if (found) return true;
-  return $("ul.pagination li a[href]").length > 0;
+function rowHtml(item) {
+  const date = item.date ? item.date.toISOString().slice(0, 10) : "—";
+  const title = item.title || "—";
+  const titleHtml = item.pageUrl
+    ? `<a href="${item.pageUrl}" target="_blank" rel="noopener">${esc(title)}</a>`
+    : esc(title);
+  const dl = item.downloadUrl
+    ? ` · <a href="${item.downloadUrl}" target="_blank" rel="noopener">Ladda ner</a>`
+    : "";
+  return `<tr><td class="date-col">${date}</td><td>${titleHtml}${dl}</td></tr>`;
 }
 
 function htmlDoc(rowsHtml, q, count) {
@@ -106,7 +143,7 @@ function htmlDoc(rowsHtml, q, count) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Huddinge – sorterade sökresultat: ${escapeHtml(q)}</title>
+<title>Huddinge – sorterade sökresultat: ${esc(q)}</title>
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
   h1 { font-size: 1.35rem; margin: 0 0 8px; }
@@ -123,7 +160,7 @@ function htmlDoc(rowsHtml, q, count) {
 </head>
 <body>
   <h1>Huddinge – sorterade sökresultat</h1>
-  <div class="meta">Sökterm: <strong>${escapeHtml(q)}</strong> · Antal: ${count} · Genererad: ${gen}</div>
+  <div class="meta">Sökterm: <strong>${esc(q)}</strong> · Antal: ${count} · Genererad: ${gen}</div>
 
   <div class="buttons">
     <a id="refresh" class="btn" href="#">↻ Uppdatera nu</a>
@@ -137,47 +174,43 @@ function htmlDoc(rowsHtml, q, count) {
 <script>
   document.getElementById('refresh').addEventListener('click', (e) => {
     e.preventDefault();
-    const url = new URL(window.location.href);
-    url.searchParams.set('t', Date.now()); // cache-bust
-    window.location.href = url.toString();
+    const u = new URL(window.location.href);
+    u.searchParams.set('t', Date.now()); // cache-bust
+    window.location.href = u.toString();
   });
 </script>
-
 </body>
 </html>`;
 }
 
 export default async function handler(req, res) {
   try {
-    const { searchParams } = new URL(req.url, "http://x");
-    const q = searchParams.get("q") || "Solfagraskolan";
+    const url = new URL(req.url, "http://x");
+    const q = url.searchParams.get("q") || "Solfagraskolan";
 
     let page = 1;
     const items = [];
     while (true) {
-      const $ = await fetchPage(q, page);
-      const cards = findCards($);
-      for (const $card of cards) {
-        const item = extractCard($card);
-        if (item.title || item.pageUrl) items.push(item);
-      }
-      if (!hasNextPage($)) break;
+      const html = await fetchPage(q, page);
+      const more = extractItemsFromHtml(html);
+      items.push(...more);
+      if (!hasNextPage(html)) break;
       page += 1;
-      if (page > 50) break; // skydd
+      if (page > 50) break; // safety
     }
 
-    const withDate = items.filter(x => x.date);
+    // sortera: med datum (desc) först, sedan utan datum
+    const withDate = items.filter(x => !!x.date).sort((a,b) => b.date - a.date);
     const withoutDate = items.filter(x => !x.date);
-    withDate.sort((a,b) => b.date - a.date);
     const sorted = [...withDate, ...withoutDate];
 
     const rows = sorted.map(rowHtml).join("");
     const html = htmlDoc(rows, q, sorted.length);
-
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.status(200).send(html);
   } catch (err) {
-    res.status(500).send(`<pre>${String(err)}</pre>`);
+    res.status(500).send(
+      `<pre>${(err && err.stack) ? esc(err.stack) : esc(String(err))}</pre>`
+    );
   }
 }
-
