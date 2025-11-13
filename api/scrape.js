@@ -1,9 +1,10 @@
-// /api/scrape.js  – generisk sökning, ingen extern dependency
+// /api/scrape.js – generisk sökning, grupperad per månad, bättre datumlogik (ankare → närmaste datum)
 
 const BASE = "https://sammantraden.huddinge.se";
 const SEARCH = `${BASE}/search`;
-const DATE_RX = /\b(20\d{2})[-/.](\d{2})[-/.](\d{2})\b/g;
-const A_TAG_RX = /<a\s+[^>]*href\s*=\s*"(.*?)"[^>]*>([\s\S]*?)<\/a>/gi;
+
+// YYYY-MM-DD (tillåter även / och . som separators)
+const DATE_RX_GLOBAL = /\b(20\d{2})[-/.](\d{2})[-/.](\d{2})\b/g;
 
 function esc(s) {
   return String(s ?? "")
@@ -19,7 +20,7 @@ function stripTags(s) {
     .trim();
 }
 
-function parseDateOne(s) {
+function parseDateOneFromString(s) {
   const m = /\b(20\d{2})[-/.](\d{2})[-/.](\d{2})\b/.exec(s || "");
   if (!m) return null;
   const [_, y, mo, d] = m;
@@ -42,62 +43,81 @@ async function fetchPage(q, index) {
   return await res.text();
 }
 
-// Plocka ut kandidater runt varje datum: titel, sidlänk, ev. pdf-länk
+/**
+ * Ny logik:
+ *  - iterera över alla <a href="...">...</a> i hela HTML
+ *  - filtrera ner till sådana som ser ut som dokumentlänkar (href slutar med .pdf eller innehåller "/documents/")
+ *  - ta ett lokalt fönster runt ankaret och leta datum där, välj närmaste
+ */
 function extractItemsFromHtml(html) {
   const items = [];
-  const text = html;
 
-  let m;
-  while ((m = DATE_RX.exec(text)) !== null) {
-    const dateStr = m[0];
-    const pos = m.index;
+  const anchorRe = /<a\s+[^>]*href\s*=\s*"(.*?)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
 
-    const start = Math.max(0, pos - 2000);
-    const end = Math.min(text.length, pos + 2000);
-    const windowHtml = text.slice(start, end);
+  while ((match = anchorRe.exec(html)) !== null) {
+    const href = match[1] || "";
+    const inner = match[2] || "";
+    const text = stripTags(inner);
+    const idx = match.index;
 
-    const anchors = [];
-    let am;
-    while ((am = A_TAG_RX.exec(windowHtml)) !== null) {
-      const href = am[1] || "";
-      const inner = am[2] || "";
-      const txt = stripTags(inner);
-      anchors.push({ href, txt });
+    const hrefLower = href.toLowerCase();
+
+    // Heuristik: välj bara länkar som ser ut som dokument (själva titeln)
+    if (!text) continue;
+    if (href.startsWith("#")) continue;
+    if (
+      !hrefLower.endsWith(".pdf") &&
+      !hrefLower.includes("/documents/")
+    ) {
+      continue;
     }
 
-    let title = "";
+    // Ta ett fönster runt länken, t ex ±800 tecken
+    const span = 800;
+    const start = Math.max(0, idx - span);
+    const end = Math.min(html.length, idx + span);
+    const windowHtml = html.slice(start, end);
+
+    // Leta datum i fönstret, välj det datum vars position är närmast länken
+    const dateRe = new RegExp(DATE_RX_GLOBAL.source, "g");
+    let dMatch;
+    let bestDelta = Infinity;
+    let bestDate = null;
+
+    while ((dMatch = dateRe.exec(windowHtml)) !== null) {
+      const dateStr = dMatch[0];
+      const datePosInWindow = dMatch.index;
+      const datePosInFull = start + datePosInWindow;
+      const delta = Math.abs(datePosInFull - idx);
+      const dt = parseDateOneFromString(dateStr);
+      if (dt && delta < bestDelta) {
+        bestDelta = delta;
+        bestDate = dt;
+      }
+    }
+
+    // Bygg absoluta URL:er
     let pageUrl = null;
-    for (const a of anchors) {
-      if (!a.txt) continue;
-      if (a.href.startsWith("#")) continue;
-      if (/ladda\s*ner/i.test(a.txt)) continue;
-      title = a.txt;
-      try {
-        pageUrl = new URL(a.href, BASE).toString();
-      } catch {
-        pageUrl = null;
-      }
-      if (title && pageUrl) break;
+    try {
+      pageUrl = new URL(href, BASE).toString();
+    } catch {
+      pageUrl = null;
     }
 
-    let downloadUrl = null;
-    for (const a of anchors) {
-      const h = (a.href || "").toLowerCase();
-      if (h.endsWith(".pdf") || h.includes("download")) {
-        try {
-          downloadUrl = new URL(a.href, BASE).toString();
-        } catch {}
-        if (downloadUrl) break;
-      }
-    }
+    // Här är titellänken nästan alltid själva pdf:en → använd samma som download
+    const downloadUrl = pageUrl;
 
-    const date = parseDateOne(dateStr);
-
-    if (title || pageUrl || date) {
-      items.push({ title, pageUrl, downloadUrl, date, _pos: pos });
-    }
+    items.push({
+      title: text,
+      pageUrl,
+      downloadUrl,
+      date: bestDate,
+      _pos: idx,
+    });
   }
 
+  // Rensa dubbletter (titel + url + datum)
   const uniq = [];
   const seen = new Set();
   for (const it of items) {
@@ -224,8 +244,7 @@ function buildHtmlByMonth(items, q) {
   document.getElementById('refresh').addEventListener('click', (e) => {
     e.preventDefault();
     const u = new URL(window.location.href);
-    // behåll q, men bumpa 't' för cache-bust
-    u.searchParams.set('t', Date.now());
+    u.searchParams.set('t', Date.now()); // cache-bust
     window.location.href = u.toString();
   });
 </script>
@@ -239,7 +258,6 @@ export default async function handler(req, res) {
     const rawQ = url.searchParams.get("q") || "";
     const q = rawQ.trim();
 
-    // Om ingen sökterm: visa bara sidan med sökfält, inga resultat
     if (!q) {
       const html = buildHtmlByMonth([], "");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -250,7 +268,7 @@ export default async function handler(req, res) {
     const items = [];
     const seenKeys = new Set();
 
-    // Paginerar över pindex = 1,2,3,... med psize=1000
+    // pindex = 1,2,3,... med psize=1000
     for (let idx = 1; idx <= 50; idx++) {
       const html = await fetchPage(q, idx);
       const pageItems = extractItemsFromHtml(html);
